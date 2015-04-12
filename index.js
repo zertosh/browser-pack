@@ -5,17 +5,24 @@ var umd = require('umd');
 
 var fs = require('fs');
 var path = require('path');
+var crypto = require('crypto');
 
 var combineSourceMap = require('combine-source-map');
 
 var defaultPreludePath = path.join(__dirname, '_prelude.js');
 var defaultPrelude = fs.readFileSync(defaultPreludePath, 'utf8');
 
+var cache = {};
+
 function newlinesIn(src) {
   if (!src) return 0;
   var newlines = src.match(/\n/g);
 
   return newlines ? newlines.length : 0;
+}
+
+function hash(str) {
+    return crypto.createHash('sha1').update(str).digest('hex');
 }
 
 module.exports = function (opts) {
@@ -36,6 +43,7 @@ module.exports = function (opts) {
     var preludePath = opts.preludePath ||
         path.relative(basedir, defaultPreludePath).replace(/\\/g, '/');
     
+    var evaled = opts.debug === 'eval';
     var lineno = 1 + newlinesIn(prelude);
     var sourcemap;
     
@@ -52,7 +60,7 @@ module.exports = function (opts) {
         }
         if (first) stream.push(Buffer(prelude + '({'));
         
-        if (row.sourceFile && !row.nomap) {
+        if (!evaled && row.sourceFile && !row.nomap) {
             if (!sourcemap) {
                 sourcemap = combineSourceMap.create();
                 sourcemap.addFile(
@@ -66,14 +74,45 @@ module.exports = function (opts) {
             );
         }
         
+        var wrappedModule;
+        if (!evaled) {
+            wrappedModule = [
+                'function(require,module,exports){\n',
+                combineSourceMap.removeComments(row.source),
+                '\n}'
+            ].join('');
+        } else {
+            var key = row.sourceFile + '::' + row.nomap + '::' + hash(row.source);
+            if (key in cache) {
+                wrappedModule = cache[key];
+            } else {
+                if (row.sourceFile && !row.nomap) {
+                    sourcemap = combineSourceMap.create();
+                    sourcemap.addFile(
+                        { sourceFile: row.sourceFile, source: row.source },
+                        { line: 1 }
+                    );
+                }
+                wrappedModule = cache[key] = [
+                    'eval(',
+                        JSON.stringify(
+                            '(function(require,module,exports){\n' +
+                            combineSourceMap.removeComments(row.source) +
+                            (sourcemap ? '\n' + sourcemap.comment() : '') +
+                            '\n})'
+                        ),
+                    ')'
+                ].join('');
+                sourcemap = null;
+            }
+        }
+        
         var wrappedSource = [
             (first ? '' : ','),
             JSON.stringify(row.id),
             ':[',
-            'function(require,module,exports){\n',
-            combineSourceMap.removeComments(row.source),
-            '\n},',
-            '{' + Object.keys(row.deps || {}).sort().map(function (key) {
+            wrappedModule,
+            ',{' + Object.keys(row.deps || {}).sort().map(function (key) {
                 return JSON.stringify(key) + ':'
                     + JSON.stringify(row.deps[key])
                 ;
